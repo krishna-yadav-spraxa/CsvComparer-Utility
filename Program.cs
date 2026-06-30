@@ -17,32 +17,49 @@ var newParsed = CsvParser.Parse(opts.NewPath, delim);
 if (oldParsed.Count == 0) Abort($"File is empty: {opts.OldPath}");
 if (newParsed.Count == 0) Abort($"File is empty: {opts.NewPath}");
 
-// Trim header names — prevents false mismatches from trailing spaces or BOM remnants
-string[] oldHeaders = oldParsed[0].Select(h => h.Trim()).ToArray();
-string[] newHeaders = newParsed[0].Select(h => h.Trim()).ToArray();
+// Trim header names and drop trailing empty columns (common Excel/SSMS export artefact)
+string[] oldHeaders = TrimHeaders(oldParsed[0]);
+string[] newHeaders = TrimHeaders(newParsed[0]);
 
-if (!oldHeaders.SequenceEqual(newHeaders, StringComparer.OrdinalIgnoreCase))
-    Abort($"Column headers do not match.\n  Old: {string.Join(", ", oldHeaders)}\n  New: {string.Join(", ", newHeaders)}");
+var excludeSet  = new HashSet<string>(opts.ExcludeColumns, StringComparer.OrdinalIgnoreCase);
+var oldHeaderSet = new HashSet<string>(oldHeaders, StringComparer.OrdinalIgnoreCase);
+var newHeaderSet = new HashSet<string>(newHeaders, StringComparer.OrdinalIgnoreCase);
 
-// Build active column list — drop any columns the user excluded
-var excludeSet = new HashSet<string>(opts.ExcludeColumns, StringComparer.OrdinalIgnoreCase);
-var activeCols = oldHeaders
-    .Select((name, srcIdx) => (name, srcIdx))
-    .Where(x => !excludeSet.Contains(x.name))
-    .ToList();
+// Report columns that exist in only one file — these are skipped automatically
+string[] onlyInOld = oldHeaders.Where(h => !newHeaderSet.Contains(h) && !excludeSet.Contains(h)).ToArray();
+string[] onlyInNew = newHeaders.Where(h => !oldHeaderSet.Contains(h) && !excludeSet.Contains(h)).ToArray();
+if (onlyInOld.Length > 0) Console.WriteLine($"Skipped (only in Old) : {string.Join(", ", onlyInOld)}");
+if (onlyInNew.Length > 0) Console.WriteLine($"Skipped (only in New) : {string.Join(", ", onlyInNew)}");
+if (onlyInOld.Length > 0 || onlyInNew.Length > 0) Console.WriteLine();
 
-if (activeCols.Count == 0) Abort("No columns remain after applying --exclude.");
+// Active columns: present in BOTH files and not excluded (old file's order is used)
+string[] headers = oldHeaders
+    .Where(h => newHeaderSet.Contains(h) && !excludeSet.Contains(h))
+    .ToArray();
 
-string[] headers  = activeCols.Select(x => x.name).ToArray();
-int[]    srcIndex = activeCols.Select(x => x.srcIdx).ToArray(); // maps active-column index → original index
-int      colCount = headers.Length;
+if (headers.Length == 0) Abort("No columns in common between the two files.");
+
+// Build separate source-index maps for each file (columns may be in different order)
+var newColLookup = newHeaders
+    .Select((name, i) => (name, i))
+    .ToDictionary(x => x.name, x => x.i, StringComparer.OrdinalIgnoreCase);
+
+int[] oldSrcIndex = headers
+    .Select(h => Array.FindIndex(oldHeaders, x => x.Equals(h, StringComparison.OrdinalIgnoreCase)))
+    .ToArray();
+int[] newSrcIndex = headers
+    .Select(h => newColLookup[h])
+    .ToArray();
+
+int colCount = headers.Length;
 
 int[] keyIndices = ResolveKeyIndices(headers, opts.KeyColumns);
 
 var oldRows = oldParsed.Skip(1).ToList();
 var newRows = newParsed.Skip(1).ToList();
 
-Console.WriteLine($"Columns (active) : {colCount}{(excludeSet.Count > 0 ? $"  ({excludeSet.Count} excluded: {string.Join(", ", opts.ExcludeColumns)})" : "")}");
+int skippedTotal = onlyInOld.Length + onlyInNew.Length + excludeSet.Count;
+Console.WriteLine($"Columns (active) : {colCount}{(skippedTotal > 0 ? $"  ({skippedTotal} skipped)" : "")}");
 Console.WriteLine($"Old data rows    : {oldRows.Count:N0}");
 Console.WriteLine($"New data rows    : {newRows.Count:N0}");
 if (keyIndices.Length > 0) Console.WriteLine($"Key columns      : {string.Join(", ", opts.KeyColumns)}");
@@ -51,9 +68,9 @@ if (opts.IgnoreCase)       Console.WriteLine("Ignore case      : on");
 if (opts.Compact)          Console.WriteLine("Compact output   : on");
 Console.WriteLine();
 
-// Remap every row so it only contains the active columns (in active-column order)
-var oldActive = oldRows.Select(r => Remap(r, srcIndex, colCount)).ToList();
-var newActive = newRows.Select(r => Remap(r, srcIndex, colCount)).ToList();
+// Remap every row to active columns only, using each file's own index map
+var oldActive = oldRows.Select(r => Remap(r, oldSrcIndex, colCount)).ToList();
+var newActive = newRows.Select(r => Remap(r, newSrcIndex, colCount)).ToList();
 
 var diffs = keyIndices.Length > 0
     ? Comparer.ByKey(oldActive, newActive, colCount, keyIndices, opts)
@@ -137,4 +154,14 @@ static string[] Remap(string[] row, int[] srcIndex, int colCount)
         result[i] = s < row.Length ? (row[s] ?? "") : "";
     }
     return result;
+}
+
+// Trim each header name and remove any trailing empty/whitespace-only columns.
+// Handles a common artefact where Excel or SSMS appends extra empty columns.
+static string[] TrimHeaders(string[] raw)
+{
+    var trimmed = raw.Select(h => h.Trim()).ToArray();
+    int last = trimmed.Length - 1;
+    while (last >= 0 && string.IsNullOrWhiteSpace(trimmed[last])) last--;
+    return trimmed[0..(last + 1)];
 }
